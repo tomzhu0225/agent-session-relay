@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from agent_relay.adapters import ClaudeAdapter, CodexAdapter, GrokAdapter
+from agent_relay.adapters import AgyAdapter, ClaudeAdapter, CodexAdapter, GrokAdapter
 from agent_relay.models import AgentInfo
 from agent_relay.recovery import build_recovery_bundle
 from agent_relay.skills import SkillRecord
@@ -243,6 +244,133 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("Implemented the core", rendered)
         self.assertNotIn("private reasoning", rendered)
         self.assertNotIn("sidechain output", rendered)
+
+    def test_agy_matches_workspace_and_excludes_internal_transcript(self) -> None:
+        home = self.root / ".gemini" / "antigravity-cli"
+        session_id = "55555555-5555-4555-8555-555555555555"
+        transcript = (
+            home
+            / "brain"
+            / session_id
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+        write_jsonl(
+            transcript,
+            [
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": "2026-08-24T00:00:00Z",
+                    "content": (
+                        "<USER_REQUEST>\nFinish the AGY adapter\n</USER_REQUEST>\n"
+                        "<ADDITIONAL_METADATA>private wrapper data</ADDITIONAL_METADATA>"
+                    ),
+                },
+                {
+                    "step_index": 1,
+                    "source": "SYSTEM",
+                    "type": "CHECKPOINT",
+                    "status": "DONE",
+                    "created_at": "2026-08-24T00:00:01Z",
+                    "content": "private internal checkpoint",
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-08-24T00:00:02Z",
+                    "content": "The AGY adapter is ready.",
+                },
+            ],
+        )
+        # Some AGY versions omit conversationId on the first history row.
+        write_jsonl(
+            home / "history.jsonl",
+            [
+                {
+                    "display": "Finish the AGY adapter",
+                    "timestamp": 1787529600000,
+                    "workspace": str(self.workspace),
+                }
+            ],
+        )
+
+        adapter = AgyAdapter(AgentInfo("agy", "/bin/true", "test", home))
+        sources = list(adapter.metadata_files())
+        self.assertEqual(sources, [transcript])
+        session = adapter.parse_session(transcript)
+        self.assertIsNotNone(session)
+        assert session is not None
+        self.assertEqual(session.cwd, self.workspace)
+        self.assertEqual(session.title, "Finish the AGY adapter")
+        self.assertEqual(session.status, "completed-turn")
+
+        normalized = adapter.normalize(session)
+        self.assertEqual(normalized.first_requests, ["Finish the AGY adapter"])
+        rendered = "\n".join(event.text for event in normalized.events)
+        self.assertIn("The AGY adapter is ready", rendered)
+        self.assertNotIn("private internal checkpoint", rendered)
+        self.assertNotIn("private wrapper data", rendered)
+        self.assertEqual(
+            adapter.native_resume_command(session),
+            ["/bin/true", "--conversation", session_id],
+        )
+        self.assertEqual(
+            adapter.cross_launch_command(self.workspace, "Read the relay bundle"),
+            ["/bin/true", "--prompt-interactive", "Read the relay bundle"],
+        )
+
+    def test_agy_uses_summary_database_for_workspace(self) -> None:
+        home = self.root / ".gemini" / "antigravity-cli"
+        session_id = "66666666-6666-4666-8666-666666666666"
+        conversation = home / "conversations" / f"{session_id}.db"
+        conversation.parent.mkdir(parents=True)
+        with sqlite3.connect(conversation) as connection:
+            connection.execute("CREATE TABLE placeholder (value TEXT)")
+
+        summary_database = home / "conversation_summaries.db"
+        with sqlite3.connect(summary_database) as connection:
+            connection.execute(
+                """
+                CREATE TABLE conversation_summaries (
+                    conversation_id TEXT,
+                    title TEXT,
+                    preview TEXT,
+                    last_modified_time INTEGER,
+                    workspace_uris TEXT,
+                    status TEXT,
+                    agent_name TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    "Summary-backed AGY session",
+                    "",
+                    1787529600000,
+                    json.dumps([self.workspace.as_uri()]),
+                    "SAVED",
+                    "gemini-test",
+                ),
+            )
+
+        adapter = AgyAdapter(AgentInfo("agy", "/bin/true", "test", home))
+        sources = list(adapter.metadata_files())
+        self.assertEqual(sources, [conversation])
+        session = adapter.parse_session(conversation)
+        self.assertIsNotNone(session)
+        assert session is not None
+        self.assertEqual(session.cwd, self.workspace)
+        self.assertEqual(session.title, "Summary-backed AGY session")
+        self.assertEqual(session.status, "saved")
+        self.assertEqual(session.model, "gemini-test")
 
     def test_recovery_bundle_is_private(self) -> None:
         home = self.root / ".grok"

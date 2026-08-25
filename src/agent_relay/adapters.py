@@ -5,8 +5,9 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import re
+import sqlite3
 from typing import Any, Iterable
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlparse
 
 from .index import IndexCache
 from .models import AgentInfo, NormalizedEvent, NormalizedTranscript, Session
@@ -26,6 +27,10 @@ MAX_RECENT_EVENTS = 120
 MAX_FIRST_REQUESTS = 3
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+AGY_USER_REQUEST_RE = re.compile(
+    r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -53,6 +58,14 @@ def _head_objects(
 
 def _message_text(payload: dict[str, Any]) -> str:
     return content_text(payload.get("content"))
+
+
+def _agy_user_text(content: Any) -> str:
+    """Remove AGY's metadata envelope from an explicit user request."""
+
+    text = content_text(content).strip()
+    match = AGY_USER_REQUEST_RE.search(text)
+    return match.group(1).strip() if match else text
 
 
 def _append_event(
@@ -603,10 +616,388 @@ class ClaudeAdapter(AgentAdapter):
         return [self.command, prompt]
 
 
+class AgyAdapter(AgentAdapter):
+    """Adapter for Google Antigravity CLI (``agy``) conversations."""
+
+    name = "agy"
+
+    def __init__(self, info: AgentInfo) -> None:
+        super().__init__(info)
+        self.summaries: dict[str, dict[str, Any]] = {}
+        self.history: list[dict[str, Any]] = []
+        self.direct_history: dict[str, list[dict[str, Any]]] = {}
+        self.workspace_by_session: dict[str, Path] = {}
+        self.transcript_metadata: dict[str, dict[str, Any]] = {}
+
+    def _transcript_path(self, session_id: str) -> Path:
+        return (
+            self.history_home
+            / "brain"
+            / session_id
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+
+    @staticmethod
+    def _session_id_from_path(path: Path) -> str:
+        if path.name == "transcript.jsonl" and len(path.parents) >= 3:
+            return path.parents[2].name
+        return path.stem
+
+    @staticmethod
+    def _workspace_path(value: Any) -> Path | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        text = value.strip()
+        if text.startswith("file:"):
+            parsed = urlparse(text)
+            decoded = unquote(parsed.path)
+            if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+                decoded = f"//{parsed.netloc}{decoded}"
+            text = decoded
+        if not text:
+            return None
+        return Path(text).expanduser()
+
+    @classmethod
+    def _summary_workspaces(cls, value: Any) -> list[Path]:
+        decoded = value
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                decoded = value
+        if isinstance(decoded, dict):
+            candidates = list(decoded.values())
+        elif isinstance(decoded, list):
+            candidates = decoded
+        else:
+            candidates = [decoded]
+        paths: list[Path] = []
+        for candidate in candidates:
+            path = cls._workspace_path(candidate)
+            if path is not None:
+                paths.append(path)
+        return paths
+
+    def _source_files(self) -> list[Path]:
+        sources: dict[str, Path] = {}
+        conversations = self.history_home / "conversations"
+        if conversations.is_dir():
+            for path in conversations.glob("*.db"):
+                sources[path.stem] = path
+        brain = self.history_home / "brain"
+        if brain.is_dir():
+            for path in brain.glob(
+                "*/.system_generated/logs/transcript.jsonl"
+            ):
+                sources[self._session_id_from_path(path)] = path
+        return sorted(sources.values(), key=str)
+
+    def _load_summaries(self) -> None:
+        database = self.history_home / "conversation_summaries.db"
+        if not database.is_file():
+            return
+        uri = f"file:{quote(str(database.resolve()), safe='/')}?mode=ro"
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(uri, uri=True, timeout=1)
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute("SELECT * FROM conversation_summaries")
+            for row in rows:
+                item = dict(row)
+                session_id = str(
+                    item.get("conversation_id")
+                    or item.get("conversationId")
+                    or ""
+                )
+                if not session_id:
+                    continue
+                current = self.summaries.get(session_id)
+                current_time = parse_time(
+                    current.get("last_modified_time") if current else None
+                )
+                item_time = parse_time(
+                    item.get("last_modified_time")
+                    or item.get("lastModifiedTime")
+                )
+                if current is None or item_time >= current_time:
+                    self.summaries[session_id] = item
+        except sqlite3.Error:
+            return
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _transcript_details(self, session_id: str) -> dict[str, Any]:
+        first_user = ""
+        created = 0.0
+        updated = 0.0
+        has_user = False
+        has_response = False
+        for item in valid_json_lines(self._transcript_path(session_id)):
+            source = str(item.get("source", "")).upper()
+            kind = str(item.get("type", "")).upper()
+            status = str(item.get("status", "")).upper()
+            timestamp = parse_time(item.get("created_at") or item.get("timestamp"))
+            if timestamp:
+                created = created or timestamp
+                updated = max(updated, timestamp)
+            if source.startswith("USER") and kind == "USER_INPUT":
+                text = _agy_user_text(item.get("content"))
+                if text and visible_user_text(text):
+                    has_user = True
+                    first_user = first_user or text
+            elif source == "MODEL" and kind in {
+                "PLANNER_RESPONSE",
+                "MODEL_RESPONSE",
+                "RESPONSE",
+            }:
+                if status in {"", "DONE", "COMPLETED", "SUCCESS"}:
+                    has_response = True
+        return {
+            "first_user": first_user,
+            "created_at": created,
+            "updated_at": updated,
+            "has_user": has_user,
+            "has_response": has_response,
+        }
+
+    def _load_auxiliary(self) -> None:
+        self.summaries = {}
+        self.history = list(valid_json_lines(self.history_home / "history.jsonl"))
+        self.direct_history = {}
+        self.workspace_by_session = {}
+        self.transcript_metadata = {}
+        self._load_summaries()
+
+        for item in self.history:
+            session_id = str(
+                item.get("conversationId") or item.get("conversation_id") or ""
+            )
+            if not session_id:
+                continue
+            self.direct_history.setdefault(session_id, []).append(item)
+            workspace = self._workspace_path(item.get("workspace"))
+            if workspace is not None:
+                self.workspace_by_session[session_id] = workspace
+
+        cache_path = self.history_home / "cache" / "last_conversations.json"
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached = {}
+        if isinstance(cached, dict):
+            for workspace_value, session_value in cached.items():
+                session_id = str(session_value) if session_value is not None else ""
+                workspace = self._workspace_path(workspace_value)
+                if session_id and workspace is not None:
+                    self.workspace_by_session.setdefault(session_id, workspace)
+
+        sources = self._source_files()
+        for source in sources:
+            session_id = self._session_id_from_path(source)
+            details = self._transcript_details(session_id)
+            self.transcript_metadata[session_id] = details
+
+        # Older AGY history rows do not always carry a conversation ID. Match
+        # those rows to the first explicit user request, using time only to
+        # disambiguate duplicate prompts. Each history row is assigned once.
+        candidates: list[tuple[float, str, int, Path]] = []
+        for session_id, details in self.transcript_metadata.items():
+            if session_id in self.workspace_by_session:
+                continue
+            first_user = str(details.get("first_user", "")).strip()
+            if not first_user:
+                continue
+            created = float(details.get("created_at", 0.0) or 0.0)
+            for index, item in enumerate(self.history):
+                if item.get("conversationId") or item.get("conversation_id"):
+                    continue
+                display = str(item.get("display", "")).strip()
+                workspace = self._workspace_path(item.get("workspace"))
+                if display != first_user or workspace is None:
+                    continue
+                timestamp = parse_time(item.get("timestamp"))
+                distance = abs(timestamp - created) if timestamp and created else 0.0
+                candidates.append((distance, session_id, index, workspace))
+
+        assigned_sessions: set[str] = set()
+        assigned_rows: set[int] = set()
+        for _, session_id, index, workspace in sorted(candidates):
+            if session_id in assigned_sessions or index in assigned_rows:
+                continue
+            self.workspace_by_session[session_id] = workspace
+            assigned_sessions.add(session_id)
+            assigned_rows.add(index)
+
+    def metadata_files(self) -> Iterable[Path]:
+        self._load_auxiliary()
+        return self._source_files()
+
+    def _summary_workspace(self, session_id: str) -> Path | None:
+        summary = self.summaries.get(session_id, {})
+        value = summary.get("workspace_uris") or summary.get("workspaceUris")
+        workspaces = self._summary_workspaces(value)
+        return workspaces[0] if workspaces else None
+
+    def _session_workspace(self, session_id: str) -> Path | None:
+        direct = self.direct_history.get(session_id, [])
+        for item in reversed(direct):
+            workspace = self._workspace_path(item.get("workspace"))
+            if workspace is not None:
+                return workspace
+        return self._summary_workspace(session_id) or self.workspace_by_session.get(
+            session_id
+        )
+
+    def parse_session(self, path: Path) -> Session | None:
+        session_id = self._session_id_from_path(path)
+        workspace = self._session_workspace(session_id)
+        if workspace is None:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+
+        details = self.transcript_metadata.get(session_id)
+        if details is None:
+            details = self._transcript_details(session_id)
+        summary = self.summaries.get(session_id, {})
+        direct = self.direct_history.get(session_id, [])
+        first_history = str(direct[0].get("display", "")) if direct else ""
+        title = clean_title(
+            summary.get("title")
+            or summary.get("preview")
+            or details.get("first_user")
+            or first_history
+        )
+
+        history_times = [parse_time(item.get("timestamp")) for item in direct]
+        summary_updated = parse_time(
+            summary.get("last_modified_time") or summary.get("lastModifiedTime")
+        )
+        transcript_created = float(details.get("created_at", 0.0) or 0.0)
+        transcript_updated = float(details.get("updated_at", 0.0) or 0.0)
+        created = transcript_created or next(
+            (timestamp for timestamp in history_times if timestamp), stat.st_mtime
+        )
+        updated = max(
+            [stat.st_mtime, transcript_updated, summary_updated]
+            + [timestamp for timestamp in history_times if timestamp]
+        )
+
+        summary_status = str(summary.get("status", "")).strip().lower()
+        if details.get("has_response"):
+            status = "completed-turn"
+        elif details.get("has_user"):
+            status = "interrupted"
+        else:
+            status = summary_status.replace("_", "-") or "saved"
+
+        return Session(
+            agent=self.name,
+            session_id=session_id,
+            title=title,
+            cwd=workspace,
+            source_path=path,
+            created_at=created,
+            updated_at=updated,
+            status=status,
+            model=str(summary.get("agent_name", "") or ""),
+        )
+
+    def scan(self, cache: IndexCache) -> list[Session]:
+        sessions = super().scan(cache)
+        refreshed: list[Session] = []
+        for session in sessions:
+            workspace = self._session_workspace(session.session_id)
+            summary = self.summaries.get(session.session_id, {})
+            title_value = summary.get("title") or summary.get("preview")
+            updated = parse_time(
+                summary.get("last_modified_time")
+                or summary.get("lastModifiedTime")
+            )
+            refreshed.append(
+                replace(
+                    session,
+                    cwd=workspace or session.cwd,
+                    title=clean_title(title_value) if title_value else session.title,
+                    updated_at=max(session.updated_at, updated),
+                )
+            )
+        return refreshed
+
+    def normalize(self, session: Session) -> NormalizedTranscript:
+        events: deque[NormalizedEvent] = deque(maxlen=MAX_RECENT_EVENTS)
+        first_requests: list[str] = []
+        last_error = ""
+        for item in valid_json_lines(self._transcript_path(session.session_id)):
+            source = str(item.get("source", "")).upper()
+            kind = str(item.get("type", "")).upper()
+            timestamp = str(item.get("created_at") or item.get("timestamp") or "")
+            if source == "SYSTEM" or any(
+                marker in kind
+                for marker in ("THOUGHT", "REASONING", "CHECKPOINT")
+            ):
+                continue
+            text = (
+                _agy_user_text(item.get("content"))
+                if source.startswith("USER") and kind == "USER_INPUT"
+                else content_text(item.get("content")).strip()
+            )
+            if source.startswith("USER") and kind == "USER_INPUT":
+                if not text or not visible_user_text(text):
+                    continue
+                if len(first_requests) < MAX_FIRST_REQUESTS:
+                    first_requests.append(redact(text, limit=10_000))
+                _append_event(
+                    events,
+                    "message",
+                    text,
+                    role="user",
+                    timestamp=timestamp,
+                    limit=8_000,
+                )
+            elif source == "MODEL" and kind in {
+                "PLANNER_RESPONSE",
+                "MODEL_RESPONSE",
+                "RESPONSE",
+            }:
+                _append_event(
+                    events,
+                    "message",
+                    text,
+                    role="assistant",
+                    timestamp=timestamp,
+                    limit=8_000,
+                )
+            elif source != "SYSTEM" and ("ERROR" in kind or "FAILED" in kind):
+                last_error = redact(text, limit=4_000)
+                _append_event(events, "error", text, timestamp=timestamp)
+
+        return NormalizedTranscript(
+            first_requests=first_requests,
+            events=list(events),
+            last_error=last_error,
+        )
+
+    def native_resume_command(self, session: Session) -> list[str]:
+        assert self.command is not None
+        return [self.command, "--conversation", session.session_id]
+
+    def cross_launch_command(self, cwd: Path, prompt: str) -> list[str]:
+        assert self.command is not None
+        return [self.command, "--prompt-interactive", prompt]
+
+
 def build_adapters(infos: dict[str, AgentInfo]) -> dict[str, AgentAdapter]:
     classes = {
         "codex": CodexAdapter,
         "grok": GrokAdapter,
         "claude": ClaudeAdapter,
+        "agy": AgyAdapter,
     }
     return {name: classes[name](info) for name, info in infos.items()}

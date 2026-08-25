@@ -33,7 +33,7 @@ class SkillTests(unittest.TestCase):
         os.environ["AGENT_RELAY_DATA_DIR"] = str(self.data)
         self.agents = {
             name: AgentInfo(name, "/bin/true", "test", self.root / f".{name}")
-            for name in ("codex", "grok", "claude")
+            for name in ("codex", "grok", "claude", "agy")
         }
 
     def tearDown(self) -> None:

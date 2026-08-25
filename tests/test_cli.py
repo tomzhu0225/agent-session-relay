@@ -35,6 +35,12 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["resume", "--no-git-diff"])
         self.assertTrue(args.no_git_diff)
 
+    def test_parser_accepts_agy_as_source_and_target(self) -> None:
+        sessions = build_parser().parse_args(["sessions", "--agent", "agy"])
+        resume = build_parser().parse_args(["resume", "--with", "agy"])
+        self.assertEqual(sessions.agent, "agy")
+        self.assertEqual(resume.target, "agy")
+
     def test_doctor_treats_uninstalled_agents_as_optional(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -44,6 +50,12 @@ class CliTests(unittest.TestCase):
                 "codex": AgentInfo("codex", "/bin/true", "test", codex_home),
                 "grok": AgentInfo("grok", None, None, root / ".grok"),
                 "claude": AgentInfo("claude", None, None, root / ".claude"),
+                "agy": AgentInfo(
+                    "agy",
+                    None,
+                    None,
+                    root / ".gemini" / "antigravity-cli",
+                ),
             }
             with patch(
                 "agent_relay.cli._scan", return_value=(infos, {}, [])

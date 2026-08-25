@@ -9,7 +9,7 @@ from typing import Sequence
 
 from . import __version__
 from .adapters import AgentAdapter, build_adapters
-from .config import config_path, discover_agents, save_discovery
+from .config import SUPPORTED_AGENTS, config_path, discover_agents, save_discovery
 from .index import IndexCache
 from .models import AgentInfo, Session
 from .recovery import build_recovery_bundle
@@ -452,7 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions.add_argument("directory", nargs="?", default=".")
     sessions.add_argument("--exact", action="store_true", help="match the exact directory instead of its Git worktree")
     sessions.add_argument("--all", action="store_true", help="include every directory")
-    sessions.add_argument("--agent", choices=("codex", "grok", "claude"))
+    sessions.add_argument("--agent", choices=SUPPORTED_AGENTS)
     sessions.add_argument("--limit", type=int, default=30)
     sessions.add_argument("--refresh", action="store_true", help="rebuild cached metadata")
     sessions.add_argument("--json", action="store_true", help="emit machine-readable output")
@@ -461,7 +461,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume", help="select a session and resume it with any supported agent")
     resume.add_argument("directory", nargs="?", default=".")
     resume.add_argument("--session", help="session number, ID, agent:ID, or unique title text")
-    resume.add_argument("--with", dest="target", choices=("codex", "grok", "claude"), help="target agent")
+    resume.add_argument(
+        "--with",
+        dest="target",
+        choices=SUPPORTED_AGENTS,
+        help="target agent",
+    )
     resume.add_argument("--exact", action="store_true", help="match the exact directory instead of its Git worktree")
     resume.add_argument("--all", action="store_true", help="select from every directory")
     resume.add_argument("--limit", type=int, default=30)

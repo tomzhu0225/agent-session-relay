@@ -14,7 +14,9 @@ AGENT_DEFAULTS: dict[str, tuple[str, str, str]] = {
     "codex": ("codex", "CODEX_HOME", ".codex"),
     "grok": ("grok", "GROK_HOME", ".grok"),
     "claude": ("claude", "CLAUDE_CONFIG_DIR", ".claude"),
+    "agy": ("agy", "AGY_HOME", ".gemini/antigravity-cli"),
 }
+SUPPORTED_AGENTS = tuple(AGENT_DEFAULTS)
 
 
 def config_path() -> Path:

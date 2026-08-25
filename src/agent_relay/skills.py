@@ -16,6 +16,7 @@ AGENT_SKILL_DIRS = {
     "codex": "skills",
     "grok": "skills",
     "claude": "skills",
+    "agy": "skills",
 }
 PROJECT_SKILL_DIRS = (
     ("project-shared", ".agents/skills"),

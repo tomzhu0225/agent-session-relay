@@ -27,10 +27,11 @@ relay skills sync
 
 ## What the setup agent should verify
 
-- The expected `codex`, `grok`, and/or `claude` executables are the ones found
+- The expected `codex`, `grok`, `claude`, and/or `agy` executables are the ones found
   on `PATH`.
-- `CODEX_HOME`, `GROK_HOME`, and `CLAUDE_CONFIG_DIR` are set when vendor data is
-  stored outside the default home directories.
+- `CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, and Relay's `AGY_HOME`
+  discovery override are set when vendor data is stored outside the default
+  home directories.
 - `relay sessions` finds the expected working directory.
 - Same-name, different-content skills are left unresolved for the user.
 - The recovery directory and files are private to the local user.

@@ -1,18 +1,19 @@
 # Agent Session Relay
 
-`relay` browses local coding-agent histories, shares applicable skills, and resumes a selected session with Codex, Grok, or Claude Code. It never requires the source agent to prepare a handoff.
+`relay` browses local coding-agent histories, shares applicable skills, and resumes a selected session with Codex, Grok, Claude Code, or Antigravity CLI (`agy`). It never requires the source agent to prepare a handoff.
 
 The current MVP was built and tested against:
 
 - Codex CLI 0.149.0
 - Grok Build 1.0.4
 - Claude Code 2.1.220
+- Antigravity CLI (`agy`) 1.1.20
 - Python 3.12 (Python 3.10 or newer is supported)
 
 It has no third-party Python dependencies.
 
 Agent Session Relay is an independent, unofficial project and is not affiliated
-with OpenAI, xAI, or Anthropic. CLI history formats are vendor-controlled and
+with OpenAI, xAI, Anthropic, or Google. CLI history formats are vendor-controlled and
 may change; version compatibility is tested rather than guaranteed.
 
 ## Install
@@ -77,6 +78,7 @@ When the target is the source agent, Relay delegates to the vendor's native resu
 Codex  -> codex resume <id>
 Grok   -> grok --resume <id>
 Claude -> claude --resume <id>
+AGY    -> agy --conversation <id>
 ```
 
 When the target differs, Relay reads the selected source history and creates a normalized recovery bundle under:
@@ -122,6 +124,7 @@ Shared    ~/.local/share/agent-relay/skills/
 Codex     $CODEX_HOME/skills/
 Grok      $GROK_HOME/skills/
 Claude    $CLAUDE_CONFIG_DIR/skills/
+AGY       $AGY_HOME/skills/ (default: ~/.gemini/antigravity-cli/skills/)
 Project   .agents/skills/, .codex/skills/, .grok/skills/, .claude/skills/
 ```
 
@@ -147,7 +150,7 @@ Useful options:
 ```text
 --refresh         Rebuild cached session metadata
 --dry-run         Build/print a cross-agent launch without starting it
---with AGENT      Select codex, grok, or claude non-interactively
+--with AGENT      Select codex, grok, claude, or agy non-interactively
 --session VALUE   Select by number, UUID, agent:UUID, prefix, or unique title
 --json            Machine-readable setup/session output
 --no-git-diff     Omit tracked/staged diffs from a cross-agent bundle
@@ -161,9 +164,10 @@ Relay currently recognizes:
 Codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
 Grok    ~/.grok/sessions/<encoded-cwd>/<session-id>/{summary,updates}.json*
 Claude  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+AGY     ~/.gemini/antigravity-cli/{conversations/<id>.db,brain/<id>/.system_generated/logs/transcript.jsonl}
 ```
 
-`CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, and the XDG config/state variables are respected. Discovery is saved to `~/.config/agent-relay/config.json`. The metadata cache stores paths, titles, timestamps, and IDs—not copied transcripts.
+`CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, Relay's `AGY_HOME` discovery override, and the XDG config/state variables are respected. Discovery is saved to `~/.config/agent-relay/config.json`. The metadata cache stores paths, titles, timestamps, and IDs—not copied transcripts.
 
 ## Privacy and safety
 
