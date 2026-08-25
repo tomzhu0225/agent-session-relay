@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Personal skill packages may be developed beside Relay, but the public
+# repository intentionally ships no skills.
+/portable-skills/
