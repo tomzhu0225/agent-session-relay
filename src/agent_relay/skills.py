@@ -198,13 +198,20 @@ def user_skills(agents: dict[str, AgentInfo]) -> list[SkillRecord]:
         scope="shared",
         source="relay",
     )
+    seen_roots: set[str] = set()
     for name, info in agents.items():
-        if name not in AGENT_SKILL_DIRS:
+        adapter = info.history_adapter
+        if adapter not in AGENT_SKILL_DIRS:
             continue
-        excluded = {"synced"} if name == "claude" else set()
+        root = info.history_root / AGENT_SKILL_DIRS[adapter]
+        root_key = str(root)
+        if root_key in seen_roots:
+            continue
+        seen_roots.add(root_key)
+        excluded = {"synced"} if adapter == "claude" else set()
         records.extend(
             _skills_in_root(
-                info.history_root / AGENT_SKILL_DIRS[name],
+                root,
                 scope="user",
                 source=name,
                 excluded=excluded,

@@ -1,6 +1,6 @@
 # Agent Session Relay
 
-`relay` browses local coding-agent histories, shares applicable skills, and resumes a selected session with Codex, Grok, Claude Code, or Antigravity CLI (`agy`). It never requires the source agent to prepare a handoff.
+`relay` browses local coding-agent histories, shares applicable skills, and resumes a selected session with Codex, Grok, Claude Code, Antigravity CLI (`agy`), or a compatible custom target. It never requires the source agent to prepare a handoff.
 
 The current MVP was built and tested against:
 
@@ -46,6 +46,7 @@ macOS. Python 3.10 or newer is required.
 ```bash
 relay setup
 relay skills sync
+relay agents
 cd /path/to/project
 relay sessions
 relay resume
@@ -58,6 +59,16 @@ agent to inspect and configure Relay is convenient. See
 does not let the installer modify histories or overwrite skill conflicts.
 
 `relay resume` lists sessions for the current Git worktree, newest first. Select a source session and then select the target agent.
+
+Codex-compatible deployments do not need a hardcoded Relay entry. Add their executable as a custom target and Relay will use the existing Codex history adapter:
+
+```bash
+relay agents add codex-glm --adapter codex --command codex-glm
+relay resume --session codex:<session-id> --with codex-glm --dry-run
+relay agents remove codex-glm
+```
+
+By default, a custom target is target-only. If it uses the same history root as its built-in adapter, Relay recognizes that they share history and delegates to the custom executable's native resume command instead of building a redundant recovery bundle. Use `--history-home` when a wrapper stores history elsewhere; use `--scan-history` only for a separate history root that should also appear as a source.
 
 For scripted use:
 
@@ -81,7 +92,7 @@ Claude -> claude --resume <id>
 AGY    -> agy --conversation <id>
 ```
 
-When the target differs, Relay reads the selected source history and creates a normalized recovery bundle under:
+When the target does not share the source's adapter and history root, Relay reads the selected source history and creates a normalized recovery bundle under:
 
 ```text
 ~/.local/state/agent-relay/recoveries/
@@ -99,6 +110,8 @@ skills.md
 ```
 
 The target receives a short initial prompt directing it to read `brief.md`, verify the actual working tree, review `skills.md`, and consult the longer transcript only when necessary.
+
+Custom targets using the same adapter and history root as the source (for example, Codex and a Codex-profile wrapper) also use native resume under the custom command.
 
 ## Shared skills
 
@@ -141,6 +154,7 @@ their projects.
 relay setup       Detect installed CLIs and their history homes
 relay sessions    List sessions for a directory or Git worktree
 relay resume      Select a source session and target agent
+relay agents      List agents and manage custom targets
 relay skills      List and register portable user/project skills
 relay doctor      Check commands, history stores, and indexed counts
 ```
@@ -150,7 +164,7 @@ Useful options:
 ```text
 --refresh         Rebuild cached session metadata
 --dry-run         Build/print a cross-agent launch without starting it
---with AGENT      Select codex, grok, claude, or agy non-interactively
+--with AGENT      Select a built-in or configured custom target non-interactively
 --session VALUE   Select by number, UUID, agent:UUID, prefix, or unique title
 --json            Machine-readable setup/session output
 --no-git-diff     Omit tracked/staged diffs from a cross-agent bundle
@@ -169,6 +183,21 @@ AGY     ~/.gemini/antigravity-cli/{conversations/<id>.db,brain/<id>/.system_gene
 
 `CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, Relay's `AGY_HOME` discovery override, and the XDG config/state variables are respected. Discovery is saved to `~/.config/agent-relay/config.json`. The metadata cache stores paths, titles, timestamps, and IDs—not copied transcripts.
 
+Custom target definitions are stored in the same file:
+
+```json
+{
+  "custom_agents": {
+    "codex-glm": {
+      "adapter": "codex",
+      "command": "/home/example/.local/bin/codex-glm"
+    }
+  }
+}
+```
+
+`adapter` selects one of Relay's existing parsers and launch conventions (`codex`, `grok`, `claude`, or `agy`). `command` must be an executable; put provider/profile arguments in a small wrapper script. Optional `history_home` and `scan_history` fields support deployments with a separate store. Prefer `relay agents add` and `relay agents remove` to editing this JSON.
+
 ## Privacy and safety
 
 - Vendor history files are read-only.
@@ -177,7 +206,7 @@ AGY     ~/.gemini/antigravity-cli/{conversations/<id>.db,brain/<id>/.system_gene
 - `git-diff.patch` is copied verbatim and can contain secrets. Use `--no-git-diff` for a sensitive working tree.
 - Cross-agent transfer intentionally sends the recovered context to the selected target provider once that target starts.
 - Stop or exit the original CLI before starting another writable agent in the same worktree. Relay does not yet prove that an arbitrary vendor process is inactive.
-- A different target is a recovered new session, not a byte-for-byte continuation of the source agent's internal state.
+- A target with a separate history store is a recovered new session, not a byte-for-byte continuation of the source agent's internal state.
 
 ## Development
 

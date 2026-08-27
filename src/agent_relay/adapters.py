@@ -1000,4 +1000,14 @@ def build_adapters(infos: dict[str, AgentInfo]) -> dict[str, AgentAdapter]:
         "claude": ClaudeAdapter,
         "agy": AgyAdapter,
     }
-    return {name: classes[name](info) for name, info in infos.items()}
+    result: dict[str, AgentAdapter] = {}
+    for name, info in infos.items():
+        adapter_class = classes.get(info.history_adapter)
+        if adapter_class is None:
+            continue
+        adapter = adapter_class(info)
+        # Custom agents can point at the same history format under a distinct
+        # target name while retaining the parser/launcher behavior above.
+        adapter.name = name
+        result[name] = adapter
+    return result

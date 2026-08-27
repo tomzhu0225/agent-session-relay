@@ -9,7 +9,15 @@ from typing import Sequence
 
 from . import __version__
 from .adapters import AgentAdapter, build_adapters
-from .config import SUPPORTED_AGENTS, config_path, discover_agents, save_discovery
+from .config import (
+    BUILTIN_AGENTS,
+    add_custom_agent,
+    configured_agent_names,
+    config_path,
+    discover_agents,
+    remove_custom_agent,
+    save_discovery,
+)
 from .index import IndexCache
 from .models import AgentInfo, Session
 from .recovery import build_recovery_bundle
@@ -32,7 +40,8 @@ def _scan(
     cache = IndexCache(refresh=refresh)
     sessions: list[Session] = []
     for adapter in adapters.values():
-        sessions.extend(adapter.scan(cache))
+        if adapter.info.scan_history:
+            sessions.extend(adapter.scan(cache))
     cache.save()
     sessions.sort(key=lambda session: session.updated_at, reverse=True)
     return infos, adapters, sessions
@@ -208,6 +217,97 @@ def _choose_target(source: Session, infos: dict[str, AgentInfo]) -> str:
     raise ValueError(f"unknown or unavailable target agent: {answer}")
 
 
+def _same_history(left: AgentAdapter, right: AgentAdapter) -> bool:
+    if left.info.history_adapter != right.info.history_adapter:
+        return False
+    try:
+        return left.history_home.resolve() == right.history_home.resolve()
+    except OSError:
+        return False
+
+
+def _can_resume_natively(
+    source: Session,
+    source_adapter: AgentAdapter,
+    target_adapter: AgentAdapter,
+) -> bool:
+    return source.agent == target_adapter.info.name or _same_history(
+        source_adapter,
+        target_adapter,
+    )
+
+
+def command_agents_list(args: argparse.Namespace) -> int:
+    infos = discover_agents(use_saved=True)
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "config": str(config_path()),
+                    "agents": [
+                        {
+                            "name": info.name,
+                            "adapter": info.history_adapter,
+                            "custom": info.custom,
+                            "installed": info.installed,
+                            "command": info.command,
+                            "version": info.version,
+                            "history_home": str(info.history_root),
+                            "scans_history": info.scan_history,
+                        }
+                        for info in infos.values()
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"Relay agents: {config_path()}\n")
+    for info in infos.values():
+        marker = "✓" if info.installed else "–"
+        kind = info.history_adapter + (" (custom)" if info.custom else "")
+        mode = "source/target" if info.scan_history else "target-only"
+        status = info.version or "not installed"
+        print(
+            f"{marker} {info.name:<12} adapter={kind:<14} mode={mode:<13} "
+            f"{status} — {info.history_root}"
+        )
+    return 0
+
+
+def command_agents_add(args: argparse.Namespace) -> int:
+    try:
+        path = add_custom_agent(
+            args.name,
+            args.adapter,
+            args.command,
+            history_home=args.history_home,
+            scan_history=args.scan_history,
+        )
+    except ValueError as error:
+        print(f"relay: {error}", file=sys.stderr)
+        return 2
+
+    infos = discover_agents(use_saved=True)
+    info = infos[args.name]
+    status = info.version or "command found"
+    print(f"Added custom target {info.name} ({info.history_adapter}) to {path}")
+    print(f"  command: {info.command}")
+    print(f"  history: {info.history_root} ({status})")
+    return 0
+
+
+def command_agents_remove(args: argparse.Namespace) -> int:
+    try:
+        path = remove_custom_agent(args.name)
+    except ValueError as error:
+        print(f"relay: {error}", file=sys.stderr)
+        return 2
+    print(f"Removed custom target {args.name} from {path}")
+    return 0
+
+
 def command_setup(args: argparse.Namespace) -> int:
     infos = discover_agents(use_saved=False)
     path = save_discovery(infos)
@@ -242,7 +342,11 @@ def command_setup(args: argparse.Namespace) -> int:
         marker = "✓" if info.installed else "–"
         status = info.version or "not installed"
         history = info.history_root
-        print(f"{marker} {name:<7} {status} — {counts[name]} sessions — {history}")
+        mode = "source/target" if info.scan_history else "target-only"
+        print(
+            f"{marker} {name:<12} {status} — {counts[name]} sessions — "
+            f"{mode} — {history}"
+        )
     return 0
 
 
@@ -328,11 +432,11 @@ def command_resume(args: argparse.Namespace) -> int:
         return 2
 
     bundle = None
-    if target == source.agent:
+    source_adapter = adapters[source.agent]
+    if _can_resume_natively(source, source_adapter, target_adapter):
         command = target_adapter.native_resume_command(source)
         mode = "native resume"
     else:
-        source_adapter = adapters[source.agent]
         available_skills = discover_skills(source.cwd, infos)
         bundle = build_recovery_bundle(
             source,
@@ -430,7 +534,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         healthy = healthy and okay
         marker = "✓" if info.installed and history_exists else ("!" if info.installed else "–")
         print(
-            f"{marker} {name:<7} command={info.command or 'missing'} "
+            f"{marker} {name:<12} command={info.command or 'missing'} "
             f"history={'ok' if history_exists else 'missing'} sessions={counts[name]}"
         )
     return 0 if healthy else 1
@@ -448,11 +552,52 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--json", action="store_true", help="emit machine-readable output")
     setup.set_defaults(handler=command_setup)
 
+    agents = subparsers.add_parser(
+        "agents",
+        help="list built-in agents and manage custom relay targets",
+    )
+    agents.set_defaults(handler=command_agents_list, json=False)
+    agent_commands = agents.add_subparsers(dest="agents_command")
+
+    agents_list = agent_commands.add_parser("list", help="list configured agents")
+    agents_list.add_argument("--json", action="store_true")
+    agents_list.set_defaults(handler=command_agents_list)
+
+    agents_add = agent_commands.add_parser(
+        "add",
+        help="add a custom target backed by an existing history adapter",
+    )
+    agents_add.add_argument("name", help="target name, for example codex-glm")
+    agents_add.add_argument("--adapter", choices=BUILTIN_AGENTS, required=True)
+    agents_add.add_argument(
+        "--command",
+        required=True,
+        help="one executable command or path; put provider arguments in a wrapper script",
+    )
+    agents_add.add_argument(
+        "--history-home",
+        help="history root (defaults to the adapter's discovered history home)",
+    )
+    agents_add.add_argument(
+        "--scan-history",
+        action="store_true",
+        help="also list this target's sessions (do not enable for a shared history)",
+    )
+    agents_add.set_defaults(handler=command_agents_add, json=False)
+
+    agents_remove = agent_commands.add_parser(
+        "remove",
+        help="remove a custom relay target",
+    )
+    agents_remove.add_argument("name")
+    agents_remove.set_defaults(handler=command_agents_remove, json=False)
+
     sessions = subparsers.add_parser("sessions", help="list sessions for a directory")
     sessions.add_argument("directory", nargs="?", default=".")
     sessions.add_argument("--exact", action="store_true", help="match the exact directory instead of its Git worktree")
     sessions.add_argument("--all", action="store_true", help="include every directory")
-    sessions.add_argument("--agent", choices=SUPPORTED_AGENTS)
+    agent_choices = configured_agent_names()
+    sessions.add_argument("--agent", choices=agent_choices)
     sessions.add_argument("--limit", type=int, default=30)
     sessions.add_argument("--refresh", action="store_true", help="rebuild cached metadata")
     sessions.add_argument("--json", action="store_true", help="emit machine-readable output")
@@ -464,7 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--with",
         dest="target",
-        choices=SUPPORTED_AGENTS,
+        choices=agent_choices,
         help="target agent",
     )
     resume.add_argument("--exact", action="store_true", help="match the exact directory instead of its Git worktree")

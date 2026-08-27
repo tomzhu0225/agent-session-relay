@@ -11,6 +11,15 @@ class AgentInfo:
     command: str | None
     version: str | None
     history_root: Path
+    adapter_name: str = ""
+    custom: bool = False
+    scan_history: bool = True
+
+    @property
+    def history_adapter(self) -> str:
+        """Name of the parser/launcher adapter used by this agent."""
+
+        return self.adapter_name or self.name
 
     @property
     def installed(self) -> bool:

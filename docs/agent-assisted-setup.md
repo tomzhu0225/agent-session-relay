@@ -32,6 +32,9 @@ relay skills sync
 - `CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, and Relay's `AGY_HOME`
   discovery override are set when vendor data is stored outside the default
   home directories.
+- Codex-compatible wrappers, such as provider-specific profiles, are configured with
+  `relay agents add <name> --adapter codex --command <executable>` rather than editing
+  Relay's built-in agent list.
 - `relay sessions` finds the expected working directory.
 - Same-name, different-content skills are left unresolved for the user.
 - The recovery directory and files are private to the local user.
