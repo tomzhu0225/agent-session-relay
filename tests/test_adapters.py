@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from agent_relay.adapters import AgyAdapter, ClaudeAdapter, CodexAdapter, GrokAdapter
-from agent_relay.models import AgentInfo
+from agent_relay.models import AgentInfo, Session
 from agent_relay.recovery import build_recovery_bundle
 from agent_relay.skills import SkillRecord
 
@@ -44,6 +44,7 @@ class AdapterTests(unittest.TestCase):
                     "id": session_id,
                     "cwd": str(self.workspace),
                     "timestamp": "2026-08-24T00:00:00Z",
+                    "model_provider": "openai",
                 },
             },
             {
@@ -53,6 +54,17 @@ class AdapterTests(unittest.TestCase):
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": "Fix the parser"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-24T00:00:03.500Z",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": {
+                        "model": "glm-5.3",
+                        "model_provider_id": "ZAI",
+                    },
                 },
             },
             {
@@ -91,6 +103,8 @@ class AdapterTests(unittest.TestCase):
         assert session is not None
         self.assertEqual(session.title, "Parser repair")
         self.assertEqual(session.status, "interrupted")
+        self.assertEqual(session.model, "glm-5.3")
+        self.assertEqual(session.model_provider, "ZAI")
         normalized = adapter.normalize(session)
         self.assertEqual(normalized.first_requests, ["Fix the parser"])
         rendered = "\n".join(event.text for event in normalized.events)
@@ -102,6 +116,135 @@ class AdapterTests(unittest.TestCase):
             adapter.native_resume_command(session),
             ["/bin/true", "-C", str(self.workspace), "resume", session_id],
         )
+
+    def test_codex_resume_command_overrides_stored_provider(self) -> None:
+        home = self.root / ".codex"
+        adapter = CodexAdapter(
+            AgentInfo(
+                "codex",
+                "/bin/true",
+                "test",
+                home,
+                model_provider="openai",
+            )
+        )
+        session = Session(
+            "codex-glm",
+            "11111111-1111-4111-8111-111111111111",
+            "Switch providers",
+            self.workspace,
+            home / "history.jsonl",
+            1,
+            2,
+            model_provider="ZAI",
+        )
+
+        self.assertEqual(
+            adapter.native_resume_command(session),
+            [
+                "/bin/true",
+                "-c",
+                'model_provider="openai"',
+                "-C",
+                str(self.workspace),
+                "resume",
+                session.session_id,
+            ],
+        )
+
+    def test_codex_openai_resume_blocks_foreign_reasoning_content(self) -> None:
+        home = self.root / ".codex"
+        history = home / "history.jsonl"
+        write_jsonl(
+            history,
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [
+                            {"type": "reasoning_text", "text": "GLM thought"}
+                        ],
+                        "encrypted_content": None,
+                    },
+                }
+            ],
+        )
+        adapter = CodexAdapter(
+            AgentInfo(
+                "codex",
+                "/bin/true",
+                "test",
+                home,
+                model_provider="openai",
+            )
+        )
+        session = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            "Mixed reasoning",
+            self.workspace,
+            history,
+            1,
+            2,
+            model_provider="openai",
+        )
+
+        self.assertIn("cannot replay", adapter.native_resume_blocker(session))
+
+    def test_codex_compaction_removes_older_incompatible_reasoning(self) -> None:
+        home = self.root / ".codex"
+        history = home / "history.jsonl"
+        write_jsonl(
+            history,
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "content": [
+                            {"type": "reasoning_text", "text": "old thought"}
+                        ],
+                    },
+                },
+                {
+                    "type": "compacted",
+                    "payload": {
+                        "replacement_history": [
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "summary"}
+                                ],
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        adapter = CodexAdapter(
+            AgentInfo(
+                "codex",
+                "/bin/true",
+                "test",
+                home,
+                model_provider="openai",
+            )
+        )
+        session = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            "Compacted history",
+            self.workspace,
+            history,
+            1,
+            2,
+            model_provider="openai",
+        )
+
+        self.assertEqual(adapter.native_resume_blocker(session), "")
 
     def test_codex_skips_subagent_rollout_with_shared_parent_id(self) -> None:
         home = self.root / ".codex"

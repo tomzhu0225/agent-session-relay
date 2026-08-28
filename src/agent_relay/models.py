@@ -14,6 +14,7 @@ class AgentInfo:
     adapter_name: str = ""
     custom: bool = False
     scan_history: bool = True
+    model_provider: str = ""
 
     @property
     def history_adapter(self) -> str:
@@ -38,6 +39,8 @@ class Session:
     status: str = "saved"
     branch: str = ""
     model: str = ""
+    model_provider: str = ""
+    last_touched_by: str = ""
 
     @property
     def selector(self) -> str:

@@ -9,7 +9,7 @@ from .util import atomic_write_json, state_dir
 
 
 Parser = Callable[[Path], Session | None]
-INDEX_SCHEMA_VERSION = 3
+INDEX_SCHEMA_VERSION = 4
 
 
 class IndexCache:

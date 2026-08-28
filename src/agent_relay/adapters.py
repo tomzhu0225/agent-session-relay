@@ -25,6 +25,7 @@ from .util import (
 
 MAX_RECENT_EVENTS = 120
 MAX_FIRST_REQUESTS = 3
+CODEX_COMPATIBILITY_TAIL_BYTES = 4_000_000
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -88,6 +89,64 @@ def _append_event(
         )
 
 
+def _has_nonempty_reasoning_content(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("type") != "reasoning":
+        return False
+    content = value.get("content")
+    return isinstance(content, list) and bool(content)
+
+
+def _compacted_history_is_incompatible(payload: dict[str, Any]) -> bool:
+    replacement = payload.get("replacement_history")
+    if not isinstance(replacement, list):
+        return False
+    return any(
+        _has_nonempty_reasoning_content(
+            item.get("payload") if isinstance(item, dict) else item
+        )
+        for item in replacement
+    )
+
+
+def _active_codex_history_is_incompatible(
+    records: Iterable[dict[str, Any]],
+) -> tuple[bool, bool]:
+    """Return (incompatible, saw_compaction) for the active replay history."""
+
+    incompatible = False
+    saw_compaction = False
+    for item in records:
+        record_type = item.get("type")
+        payload = item.get("payload")
+        if record_type == "compacted" and isinstance(payload, dict):
+            saw_compaction = True
+            incompatible = _compacted_history_is_incompatible(payload)
+        elif record_type == "response_item" and _has_nonempty_reasoning_content(
+            payload
+        ):
+            incompatible = True
+    return incompatible, saw_compaction
+
+
+def _codex_history_requires_openai_recovery(path: Path) -> bool:
+    """Detect active reasoning items that OpenAI cannot replay during compaction."""
+
+    tail = tail_json_lines(path, max_bytes=CODEX_COMPATIBILITY_TAIL_BYTES)
+    incompatible, saw_compaction = _active_codex_history_is_incompatible(tail)
+    if incompatible:
+        return True
+
+    try:
+        entirely_in_tail = path.stat().st_size <= CODEX_COMPATIBILITY_TAIL_BYTES
+    except OSError:
+        return False
+    if entirely_in_tail or saw_compaction:
+        return False
+
+    incompatible, _ = _active_codex_history_is_incompatible(valid_json_lines(path))
+    return incompatible
+
+
 class AgentAdapter:
     name = "agent"
 
@@ -116,6 +175,15 @@ class AgentAdapter:
 
     def cross_launch_command(self, cwd: Path, prompt: str) -> list[str]:
         raise NotImplementedError
+
+    def native_resume_blocker(
+        self,
+        session: Session,
+        source_adapter: AgentAdapter | None = None,
+    ) -> str:
+        """Explain why a shared native history should be normalized first."""
+
+        return ""
 
     def scan(self, cache: IndexCache) -> list[Session]:
         sessions: list[Session] = []
@@ -215,13 +283,21 @@ class CodexAdapter(AgentAdapter):
         updated = indexed_updated or stat.st_mtime
 
         status = "saved"
-        for item in tail_json_lines(path, max_bytes=256_000):
+        model_provider = str(metadata.get("model_provider", ""))
+        for item in tail_json_lines(path):
             if item.get("type") != "event_msg":
                 continue
             payload = item.get("payload")
             if not isinstance(payload, dict):
                 continue
-            if payload.get("type") == "turn_aborted":
+            if payload.get("type") == "thread_settings_applied":
+                settings = payload.get("thread_settings")
+                if isinstance(settings, dict):
+                    model = str(settings.get("model", model))
+                    model_provider = str(
+                        settings.get("model_provider_id", model_provider)
+                    )
+            elif payload.get("type") == "turn_aborted":
                 status = "interrupted"
             elif payload.get("type") == "task_complete":
                 status = "completed-turn"
@@ -236,6 +312,7 @@ class CodexAdapter(AgentAdapter):
             updated_at=updated,
             status=status,
             model=model,
+            model_provider=model_provider,
         )
 
     def normalize(self, session: Session) -> NormalizedTranscript:
@@ -296,11 +373,52 @@ class CodexAdapter(AgentAdapter):
 
     def native_resume_command(self, session: Session) -> list[str]:
         assert self.command is not None
-        return [self.command, "-C", str(session.cwd), "resume", session.session_id]
+        provider_args = (
+            ["-c", f"model_provider={json.dumps(self.info.model_provider)}"]
+            if self.info.model_provider
+            else []
+        )
+        return [
+            self.command,
+            *provider_args,
+            "-C",
+            str(session.cwd),
+            "resume",
+            session.session_id,
+        ]
+
+    def native_resume_blocker(
+        self,
+        session: Session,
+        source_adapter: AgentAdapter | None = None,
+    ) -> str:
+        source_provider_name = session.model_provider or (
+            source_adapter.info.model_provider if source_adapter is not None else ""
+        )
+        source_provider = source_provider_name.strip().casefold()
+        target_provider = self.info.model_provider.strip().casefold()
+        if source_provider and target_provider and source_provider != target_provider:
+            return (
+                f"provider change {source_provider_name} -> "
+                f"{self.info.model_provider} requires normalized recovery"
+            )
+        if target_provider == "openai" and _codex_history_requires_openai_recovery(
+            session.source_path
+        ):
+            return (
+                "active history contains provider-specific reasoning content that "
+                "OpenAI compaction cannot replay"
+            )
+        return ""
 
     def cross_launch_command(self, cwd: Path, prompt: str) -> list[str]:
         assert self.command is not None
-        return [self.command, "-C", str(cwd), prompt]
+        provider_args = (
+            ["-c", f"model_provider={json.dumps(self.info.model_provider)}"]
+            if self.info.model_provider
+            else []
+        )
+        return [self.command, *provider_args, "-C", str(cwd), prompt]
 
 
 class GrokAdapter(AgentAdapter):

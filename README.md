@@ -58,17 +58,17 @@ agent to inspect and configure Relay is convenient. See
 [Agent-assisted setup](docs/agent-assisted-setup.md) for a bounded prompt that
 does not let the installer modify histories or overwrite skill conflicts.
 
-`relay resume` lists sessions for the current Git worktree, newest first. Select a source session and then select the target agent.
+`relay resume` lists sessions for the current Git worktree, newest first. Its `Last agent` column distinguishes standard Codex (`codex-native`) from configured wrappers such as `codex-glm`. Relay uses the latest provider metadata in Codex history and retains the selected target for native resumes as a fallback. Select a source session and then select the target agent.
 
 Codex-compatible deployments do not need a hardcoded Relay entry. Add their executable as a custom target and Relay will use the existing Codex history adapter:
 
 ```bash
-relay agents add codex-glm --adapter codex --command codex-glm
+relay agents add codex-glm --adapter codex --command codex-glm --model-provider ZAI
 relay resume --session codex:<session-id> --with codex-glm --dry-run
 relay agents remove codex-glm
 ```
 
-By default, a custom target is target-only. If it uses the same history root as its built-in adapter, Relay recognizes that they share history and delegates to the custom executable's native resume command instead of building a redundant recovery bundle. Use `--history-home` when a wrapper stores history elsewhere; use `--scan-history` only for a separate history root that should also appear as a source.
+By default, a custom target is target-only. If it uses the same history root as its built-in adapter, Relay recognizes that they share history and delegates compatible resumes to the custom executable's native resume command. Provider-specific Codex targets should set `--model-provider`: Relay then explicitly selects that provider on launch and can attribute sessions touched outside Relay. Existing targets can be updated with `relay agents update codex-glm --model-provider ZAI`. Use `--history-home` when a wrapper stores history elsewhere; use `--scan-history` only for a separate history root that should also appear as a source.
 
 For scripted use:
 
@@ -77,6 +77,7 @@ relay sessions --json
 relay resume --session codex:<session-id> --with grok --dry-run
 relay resume --session <unique-id-prefix> --with claude
 relay resume --session <selector> --with grok --no-git-diff
+relay resume --session <selector> --with codex-glm --unsafe-native-provider-switch
 ```
 
 Use `--exact` to match only the literal working directory rather than every session in the same Git worktree. Use `--all` to search every indexed directory.
@@ -111,7 +112,9 @@ skills.md
 
 The target receives a short initial prompt directing it to read `brief.md`, verify the actual working tree, review `skills.md`, and consult the longer transcript only when necessary.
 
-Custom targets using the same adapter and history root as the source (for example, Codex and a Codex-profile wrapper) also use native resume under the custom command.
+Custom targets using the same adapter, history root, and compatible provider history use native resume under the custom command. For Codex targets with a configured `model_provider`, Relay passes an explicit provider override, so a native Codex launch does not inherit another profile's credential requirement.
+
+Codex providers can encode reasoning records differently. Replaying a mixed-provider native history may work for ordinary turns but fail later when the target provider compacts the conversation. Relay therefore handles `codex-native` ↔ provider-specific targets such as `codex-glm` as a **provider-safe recovery** by default: it creates a new target session from a bounded, normalized history bundle while retaining the task, recent visible messages, workspace state, and Git diff. If retaining the exact native session ID is more important than compaction safety, `--unsafe-native-provider-switch` restores same-history native resume and prints the detected risk.
 
 ## Shared skills
 
@@ -181,7 +184,7 @@ Claude  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
 AGY     ~/.gemini/antigravity-cli/{conversations/<id>.db,brain/<id>/.system_generated/logs/transcript.jsonl}
 ```
 
-`CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, Relay's `AGY_HOME` discovery override, and the XDG config/state variables are respected. Discovery is saved to `~/.config/agent-relay/config.json`. The metadata cache stores paths, titles, timestamps, and IDs—not copied transcripts.
+`CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`, Relay's `AGY_HOME` discovery override, and the XDG config/state variables are respected. Discovery is saved to `~/.config/agent-relay/config.json`. The metadata cache stores paths, titles, timestamps, IDs, models, and provider labels—not copied transcripts.
 
 Custom target definitions are stored in the same file:
 
@@ -190,17 +193,19 @@ Custom target definitions are stored in the same file:
   "custom_agents": {
     "codex-glm": {
       "adapter": "codex",
-      "command": "/home/example/.local/bin/codex-glm"
+      "command": "/home/example/.local/bin/codex-glm",
+      "model_provider": "ZAI"
     }
   }
 }
 ```
 
-`adapter` selects one of Relay's existing parsers and launch conventions (`codex`, `grok`, `claude`, or `agy`). `command` must be an executable; put provider/profile arguments in a small wrapper script. Optional `history_home` and `scan_history` fields support deployments with a separate store. Prefer `relay agents add` and `relay agents remove` to editing this JSON.
+`adapter` selects one of Relay's existing parsers and launch conventions (`codex`, `grok`, `claude`, or `agy`). `command` must be an executable; put provider/profile arguments in a small wrapper script. `model_provider` identifies the provider value written into Codex history and is used for explicit launch overrides and last-touch attribution. Optional `history_home` and `scan_history` fields support deployments with a separate store. Prefer `relay agents add`, `relay agents update`, and `relay agents remove` to editing this JSON.
 
 ## Privacy and safety
 
 - Vendor history files are read-only.
+- Relay stores the last target selected for native shared-history resumes in `session-targets.json`; it contains history paths and target names, not transcript contents.
 - Recovery directories use mode `0700`; recovery files use `0600`.
 - Private reasoning and source system instructions are excluded from the normalized transcript; common credential forms are heuristically redacted.
 - `git-diff.patch` is copied verbatim and can contain secrets. Use `--no-git-diff` for a sensitive working tree.

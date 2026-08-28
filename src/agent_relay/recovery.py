@@ -98,6 +98,7 @@ def build_recovery_bundle(
             "title": session.title,
             "status": session.status,
             "model": session.model,
+            "model_provider": session.model_provider,
             "branch": session.branch,
             "history_path": str(session.source_path),
             "history_bytes": history_bytes,

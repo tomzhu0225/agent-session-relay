@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from .config import (
     discover_agents,
     remove_custom_agent,
     save_discovery,
+    update_custom_agent_provider,
 )
 from .index import IndexCache
 from .models import AgentInfo, Session
@@ -28,6 +30,7 @@ from .skills import (
     shared_skills_root,
     sync_user_skills,
 )
+from .touches import load_session_targets, record_session_target
 from .util import belongs_to_scope, canonical, relative_time, render_command, state_dir
 
 
@@ -43,6 +46,16 @@ def _scan(
         if adapter.info.scan_history:
             sessions.extend(adapter.scan(cache))
     cache.save()
+    recorded_targets = load_session_targets()
+    sessions = [
+        _attribute_session(
+            session,
+            infos,
+            adapters,
+            recorded_targets.get(str(session.source_path), ""),
+        )
+        for session in sessions
+    ]
     sessions.sort(key=lambda session: session.updated_at, reverse=True)
     return infos, adapters, sessions
 
@@ -75,6 +88,8 @@ def _session_data(session: Session, number: int | None = None) -> dict[str, obje
         "status": session.status,
         "branch": session.branch,
         "model": session.model,
+        "model_provider": session.model_provider,
+        "last_touched_by": session.last_touched_by or session.agent,
         "history_path": str(session.source_path),
     }
     if number is not None:
@@ -90,7 +105,7 @@ def _print_sessions(sessions: list[Session], show_cwd: bool = False) -> None:
     for number, session in enumerate(sessions, start=1):
         row = [
             str(number),
-            session.agent,
+            session.last_touched_by or session.agent,
             relative_time(session.updated_at),
             session.status,
             session.title,
@@ -98,7 +113,7 @@ def _print_sessions(sessions: list[Session], show_cwd: bool = False) -> None:
         if show_cwd:
             row.append(str(session.cwd))
         rows.append(row)
-    headers = ["#", "Agent", "Updated", "State", "Title"]
+    headers = ["#", "Last agent", "Updated", "State", "Title"]
     if show_cwd:
         headers.append("Directory")
     widths = [len(header) for header in headers]
@@ -226,14 +241,80 @@ def _same_history(left: AgentAdapter, right: AgentAdapter) -> bool:
         return False
 
 
+def _normalized_provider(value: str) -> str:
+    return value.strip().casefold()
+
+
+def _target_label(name: str) -> str:
+    return "codex-native" if name == "codex" else name
+
+
+def _attribute_session(
+    session: Session,
+    infos: dict[str, AgentInfo],
+    adapters: dict[str, AgentAdapter],
+    recorded_target: str = "",
+) -> Session:
+    """Label the latest compatible target recorded by Relay or the provider."""
+
+    provider = _normalized_provider(session.model_provider)
+    source_adapter = adapters.get(session.agent)
+    if source_adapter is None:
+        return replace(session, last_touched_by=session.agent)
+
+    if provider:
+        if provider == _normalized_provider(source_adapter.info.model_provider):
+            return replace(session, last_touched_by=_target_label(session.agent))
+        matches = [
+            name
+            for name, info in infos.items()
+            if name != session.agent
+            and _normalized_provider(info.model_provider) == provider
+            and name in adapters
+            and _same_history(source_adapter, adapters[name])
+        ]
+        if len(matches) == 1:
+            return replace(
+                session,
+                agent=matches[0],
+                last_touched_by=_target_label(matches[0]),
+            )
+
+    recorded_adapter = adapters.get(recorded_target)
+    if recorded_adapter is not None and _same_history(
+        source_adapter, recorded_adapter
+    ):
+        return replace(
+            session,
+            agent=recorded_target,
+            last_touched_by=_target_label(recorded_target),
+        )
+
+    if not provider:
+        return replace(session, last_touched_by=_target_label(session.agent))
+    fallback = (
+        f"codex[{session.model_provider}]"
+        if session.agent == "codex"
+        else session.agent
+    )
+    return replace(session, last_touched_by=fallback)
+
+
 def _can_resume_natively(
     source: Session,
     source_adapter: AgentAdapter,
     target_adapter: AgentAdapter,
+    allow_unsafe_provider_switch: bool = False,
 ) -> bool:
-    return source.agent == target_adapter.info.name or _same_history(
+    shares_native_history = source.agent == target_adapter.info.name or _same_history(
         source_adapter,
         target_adapter,
+    )
+    if not shares_native_history:
+        return False
+    return allow_unsafe_provider_switch or not target_adapter.native_resume_blocker(
+        source,
+        source_adapter,
     )
 
 
@@ -254,6 +335,7 @@ def command_agents_list(args: argparse.Namespace) -> int:
                             "version": info.version,
                             "history_home": str(info.history_root),
                             "scans_history": info.scan_history,
+                            "model_provider": info.model_provider,
                         }
                         for info in infos.values()
                     ],
@@ -269,9 +351,10 @@ def command_agents_list(args: argparse.Namespace) -> int:
         kind = info.history_adapter + (" (custom)" if info.custom else "")
         mode = "source/target" if info.scan_history else "target-only"
         status = info.version or "not installed"
+        provider = info.model_provider or "unspecified"
         print(
             f"{marker} {info.name:<12} adapter={kind:<14} mode={mode:<13} "
-            f"{status} — {info.history_root}"
+            f"provider={provider:<11} {status} — {info.history_root}"
         )
     return 0
 
@@ -284,6 +367,7 @@ def command_agents_add(args: argparse.Namespace) -> int:
             args.command,
             history_home=args.history_home,
             scan_history=args.scan_history,
+            model_provider=args.model_provider,
         )
     except ValueError as error:
         print(f"relay: {error}", file=sys.stderr)
@@ -294,6 +378,7 @@ def command_agents_add(args: argparse.Namespace) -> int:
     status = info.version or "command found"
     print(f"Added custom target {info.name} ({info.history_adapter}) to {path}")
     print(f"  command: {info.command}")
+    print(f"  provider: {info.model_provider or 'unspecified'}")
     print(f"  history: {info.history_root} ({status})")
     return 0
 
@@ -305,6 +390,19 @@ def command_agents_remove(args: argparse.Namespace) -> int:
         print(f"relay: {error}", file=sys.stderr)
         return 2
     print(f"Removed custom target {args.name} from {path}")
+    return 0
+
+
+def command_agents_update(args: argparse.Namespace) -> int:
+    try:
+        path = update_custom_agent_provider(args.name, args.model_provider)
+    except ValueError as error:
+        print(f"relay: {error}", file=sys.stderr)
+        return 2
+    print(
+        f"Updated custom target {args.name}: "
+        f"provider={args.model_provider.strip()} in {path}"
+    )
     return 0
 
 
@@ -327,6 +425,7 @@ def command_setup(args: argparse.Namespace) -> int:
                             "command": info.command,
                             "version": info.version,
                             "history_home": str(info.history_root),
+                            "model_provider": info.model_provider,
                             "sessions": counts[name],
                         }
                         for name, info in infos.items()
@@ -433,9 +532,27 @@ def command_resume(args: argparse.Namespace) -> int:
 
     bundle = None
     source_adapter = adapters[source.agent]
-    if _can_resume_natively(source, source_adapter, target_adapter):
+    shares_native_history = source.agent == target_adapter.info.name or _same_history(
+        source_adapter,
+        target_adapter,
+    )
+    native_blocker = (
+        target_adapter.native_resume_blocker(source, source_adapter)
+        if shares_native_history
+        else ""
+    )
+    unsafe_native = bool(
+        getattr(args, "unsafe_native_provider_switch", False) and native_blocker
+    )
+    resume_natively = _can_resume_natively(
+        source,
+        source_adapter,
+        target_adapter,
+        allow_unsafe_provider_switch=unsafe_native,
+    )
+    if resume_natively:
         command = target_adapter.native_resume_command(source)
-        mode = "native resume"
+        mode = "unsafe native resume" if unsafe_native else "native resume"
     else:
         available_skills = discover_skills(source.cwd, infos)
         bundle = build_recovery_bundle(
@@ -446,15 +563,20 @@ def command_resume(args: argparse.Namespace) -> int:
         )
         prompt = bundle.bootstrap_prompt(source)
         command = target_adapter.cross_launch_command(source.cwd, prompt)
-        mode = "cross-agent recovery"
+        mode = "provider-safe recovery" if native_blocker else "cross-agent recovery"
 
     print(f"Source: {source.selector} — {source.title}")
     print(f"Target: {target} ({mode})")
+    if native_blocker:
+        print(f"Safety: {native_blocker}")
     if bundle:
         print(f"Recovery bundle: {bundle.root}")
     print(f"Command: {render_command(command)}")
     if args.dry_run:
         return 0
+
+    if resume_natively:
+        record_session_target(source, target)
 
     os.chdir(source.cwd)
     os.execv(command[0], command)
@@ -583,7 +705,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also list this target's sessions (do not enable for a shared history)",
     )
+    agents_add.add_argument(
+        "--model-provider",
+        help="provider identity stored in sessions, for example ZAI",
+    )
     agents_add.set_defaults(handler=command_agents_add, json=False)
+
+    agents_update = agent_commands.add_parser(
+        "update",
+        help="update metadata for a custom target",
+    )
+    agents_update.add_argument("name")
+    agents_update.add_argument(
+        "--model-provider",
+        required=True,
+        help="provider identity stored in sessions, for example ZAI",
+    )
+    agents_update.set_defaults(handler=command_agents_update, json=False)
 
     agents_remove = agent_commands.add_parser(
         "remove",
@@ -617,6 +755,14 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--limit", type=int, default=30)
     resume.add_argument("--refresh", action="store_true", help="rebuild cached metadata")
     resume.add_argument("--dry-run", action="store_true", help="prepare and print the launch without starting an agent")
+    resume.add_argument(
+        "--unsafe-native-provider-switch",
+        action="store_true",
+        help=(
+            "force a same-history Codex provider switch; provider-specific reasoning "
+            "records may later fail compaction"
+        ),
+    )
     resume.add_argument(
         "--no-git-diff",
         action="store_true",

@@ -33,8 +33,9 @@ relay skills sync
   discovery override are set when vendor data is stored outside the default
   home directories.
 - Codex-compatible wrappers, such as provider-specific profiles, are configured with
-  `relay agents add <name> --adapter codex --command <executable>` rather than editing
-  Relay's built-in agent list.
+  `relay agents add <name> --adapter codex --command <executable> --model-provider <provider>`
+  rather than editing Relay's built-in agent list. The provider must match the
+  profile's `model_provider` value (for example, `ZAI`).
 - `relay sessions` finds the expected working directory.
 - Same-name, different-content skills are left unresolved for the user.
 - The recovery directory and files are private to the local user.

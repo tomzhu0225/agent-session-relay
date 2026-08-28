@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+from dataclasses import replace
 import io
 import json
 import os
@@ -12,11 +13,13 @@ from unittest.mock import patch
 
 from agent_relay.adapters import CodexAdapter, build_adapters
 from agent_relay.cli import (
+    _attribute_session,
     _can_resume_natively,
     _scan,
     build_parser,
     command_agents_add,
     command_agents_remove,
+    command_agents_update,
     command_resume,
 )
 from agent_relay.config import discover_agents, save_discovery
@@ -38,6 +41,7 @@ class CustomAgentTests(unittest.TestCase):
                         "codex-glm": {
                             "adapter": "codex",
                             "command": "/bin/true",
+                            "model_provider": "ZAI",
                         }
                     },
                     "favorite_color": "orange",
@@ -74,12 +78,14 @@ class CustomAgentTests(unittest.TestCase):
         self.assertEqual(custom.history_root, infos["codex"].history_root)
         self.assertTrue(custom.installed)
         self.assertFalse(custom.scan_history)
+        self.assertEqual(custom.model_provider, "ZAI")
+        self.assertEqual(infos["codex"].model_provider, "openai")
 
         adapters = build_adapters(infos)
         self.assertIsInstance(adapters["codex-glm"], CodexAdapter)
         self.assertEqual(adapters["codex-glm"].name, "codex-glm")
 
-    def test_shared_codex_history_supports_native_wrapper_resume(self) -> None:
+    def test_shared_codex_history_blocks_provider_switch_by_default(self) -> None:
         infos = self._discover()
         adapters = build_adapters(infos)
         source = Session(
@@ -92,11 +98,51 @@ class CustomAgentTests(unittest.TestCase):
             2,
         )
 
-        self.assertTrue(
+        self.assertFalse(
             _can_resume_natively(source, adapters["codex"], adapters["codex-glm"])
         )
 
-    def test_scan_does_not_duplicate_shared_custom_history(self) -> None:
+    def test_latest_provider_wins_over_recorded_target(self) -> None:
+        infos = self._discover()
+        adapters = build_adapters(infos)
+        source = Session(
+            "codex",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "Stale provider",
+            self.root,
+            self.root / "history.jsonl",
+            1,
+            2,
+            model="gpt-5.6-sol",
+            model_provider="ZAI",
+        )
+
+        attributed = _attribute_session(
+            source, infos, adapters, recorded_target="codex"
+        )
+        self.assertEqual(attributed.agent, "codex-glm")
+        self.assertEqual(attributed.last_touched_by, "codex-glm")
+
+    def test_recorded_target_labels_sessions_without_provider_metadata(self) -> None:
+        infos = self._discover()
+        adapters = build_adapters(infos)
+        source = Session(
+            "codex",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "Recorded wrapper",
+            self.root,
+            self.root / "history.jsonl",
+            1,
+            2,
+        )
+
+        attributed = _attribute_session(
+            source, infos, adapters, recorded_target="codex-glm"
+        )
+        self.assertEqual(attributed.agent, "codex-glm")
+        self.assertEqual(attributed.last_touched_by, "codex-glm")
+
+    def test_scan_attributes_shared_history_to_custom_provider(self) -> None:
         infos = self._discover()
         session_id = "22222222-2222-4222-8222-222222222222"
         history = (
@@ -114,6 +160,7 @@ class CustomAgentTests(unittest.TestCase):
                         "id": session_id,
                         "cwd": str(self.root),
                         "timestamp": "2026-08-27T00:00:00Z",
+                        "model_provider": "ZAI",
                     },
                 }
             )
@@ -122,25 +169,26 @@ class CustomAgentTests(unittest.TestCase):
         )
 
         with patch("agent_relay.cli.discover_agents", return_value=infos), patch(
-            "agent_relay.cli.state_dir", return_value=self.root / "state"
+            "agent_relay.index.state_dir", return_value=self.root / "state"
         ):
             _, _, sessions = _scan(refresh=True)
         self.assertEqual(
             [(session.agent, session.session_id) for session in sessions],
-            [("codex", session_id)],
+            [("codex-glm", session_id)],
         )
 
     def test_resume_dry_run_uses_custom_command_for_shared_history(self) -> None:
         infos = self._discover()
         adapters = build_adapters(infos)
         source = Session(
-            "codex",
+            "codex-glm",
             "33333333-3333-4333-8333-333333333333",
             "Dry run custom target",
             self.root,
             self.root / "history.jsonl",
             1,
             2,
+            model_provider="ZAI",
         )
         args = argparse.Namespace(
             directory=str(self.root),
@@ -160,7 +208,90 @@ class CustomAgentTests(unittest.TestCase):
             result = command_resume(args)
         self.assertEqual(result, 0)
         self.assertIn("Target: codex-glm (native resume)", output.getvalue())
-        self.assertIn("/bin/true -C", output.getvalue())
+        self.assertIn("model_provider", output.getvalue())
+        self.assertIn("ZAI", output.getvalue())
+
+    def test_resume_from_glm_to_codex_uses_provider_safe_recovery(self) -> None:
+        infos = self._discover()
+        infos["codex"] = replace(infos["codex"], command="/bin/true")
+        adapters = build_adapters(infos)
+        source = Session(
+            "codex-glm",
+            "44444444-4444-4444-8444-444444444444",
+            "Return to Codex",
+            self.root,
+            self.root / "history.jsonl",
+            1,
+            2,
+            model="glm-5.3",
+            model_provider="ZAI",
+        )
+        args = argparse.Namespace(
+            directory=str(self.root),
+            session=source.selector,
+            target="codex",
+            exact=False,
+            all=False,
+            limit=30,
+            refresh=False,
+            dry_run=False,
+            no_git_diff=True,
+        )
+
+        with patch(
+            "agent_relay.cli._scan", return_value=(infos, adapters, [source])
+        ), patch("agent_relay.cli.record_session_target") as record, patch(
+            "agent_relay.cli.os.chdir"
+        ), patch("agent_relay.cli.os.execv"), patch.dict(
+            os.environ,
+            {"AGENT_RELAY_STATE_DIR": str(self.root / "state")},
+        ), redirect_stdout(io.StringIO()) as output:
+            result = command_resume(args)
+        rendered = output.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("Target: codex (provider-safe recovery)", rendered)
+        self.assertIn("provider change ZAI -> openai", rendered)
+        self.assertIn("model_provider", rendered)
+        self.assertIn("openai", rendered)
+        self.assertNotIn(f"resume {source.session_id}", rendered)
+        record.assert_not_called()
+
+    def test_unsafe_glm_to_codex_switch_keeps_native_session(self) -> None:
+        infos = self._discover()
+        infos["codex"] = replace(infos["codex"], command="/bin/true")
+        adapters = build_adapters(infos)
+        source = Session(
+            "codex-glm",
+            "44444444-4444-4444-8444-444444444444",
+            "Unsafe return to Codex",
+            self.root,
+            self.root / "history.jsonl",
+            1,
+            2,
+            model="glm-5.3",
+            model_provider="ZAI",
+        )
+        args = argparse.Namespace(
+            directory=str(self.root),
+            session=source.selector,
+            target="codex",
+            exact=False,
+            all=False,
+            limit=30,
+            refresh=False,
+            dry_run=True,
+            no_git_diff=True,
+            unsafe_native_provider_switch=True,
+        )
+
+        with patch(
+            "agent_relay.cli._scan", return_value=(infos, adapters, [source])
+        ), redirect_stdout(io.StringIO()) as output:
+            result = command_resume(args)
+        rendered = output.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("Target: codex (unsafe native resume)", rendered)
+        self.assertIn(f"resume {source.session_id}", rendered)
 
     def test_setup_preserves_custom_definitions_and_other_config_values(self) -> None:
         infos = self._discover()
@@ -169,7 +300,11 @@ class CustomAgentTests(unittest.TestCase):
         saved = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(
             saved["custom_agents"]["codex-glm"],
-            {"adapter": "codex", "command": "/bin/true"},
+            {
+                "adapter": "codex",
+                "command": "/bin/true",
+                "model_provider": "ZAI",
+            },
         )
         self.assertEqual(saved["favorite_color"], "orange")
         self.assertNotIn("codex-glm", saved["agents"])
@@ -190,6 +325,10 @@ class CustomAgentTests(unittest.TestCase):
             command=str(command),
             history_home=None,
             scan_history=False,
+            model_provider="anthropic",
+        )
+        update_args = argparse.Namespace(
+            name="claude-custom", model_provider="anthropic-enterprise"
         )
         remove_args = argparse.Namespace(name="claude-custom")
         with patch(
@@ -197,6 +336,13 @@ class CustomAgentTests(unittest.TestCase):
         ), patch("agent_relay.config.command_version", return_value=None):
             with redirect_stdout(io.StringIO()):
                 command_agents_add(args)
+            with redirect_stdout(io.StringIO()):
+                command_agents_update(update_args)
+            saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved["custom_agents"]["claude-custom"]["model_provider"],
+                "anthropic-enterprise",
+            )
             with redirect_stdout(io.StringIO()):
                 command_agents_remove(remove_args)
         self.assertNotIn("claude-custom", self._discover())

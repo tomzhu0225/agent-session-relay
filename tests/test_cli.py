@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from agent_relay.cli import _resolve_session, build_parser, command_doctor
+from agent_relay.cli import _print_sessions, _resolve_session, build_parser, command_doctor
 from agent_relay.models import AgentInfo, Session
 
 
@@ -34,6 +34,30 @@ class CliTests(unittest.TestCase):
     def test_resume_parser_accepts_no_git_diff(self) -> None:
         args = build_parser().parse_args(["resume", "--no-git-diff"])
         self.assertTrue(args.no_git_diff)
+
+    def test_resume_parser_accepts_unsafe_native_provider_switch(self) -> None:
+        args = build_parser().parse_args(
+            ["resume", "--unsafe-native-provider-switch"]
+        )
+        self.assertTrue(args.unsafe_native_provider_switch)
+
+    def test_session_list_labels_last_touch_target(self) -> None:
+        root = Path("/tmp/relay-last-touch-test")
+        session = Session(
+            "codex",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "Provider switch",
+            root,
+            root / "history.jsonl",
+            1,
+            2,
+            model_provider="openai",
+            last_touched_by="codex-native",
+        )
+        with redirect_stdout(io.StringIO()) as output:
+            _print_sessions([session])
+        self.assertIn("Last agent", output.getvalue())
+        self.assertIn("codex-native", output.getvalue())
 
     def test_parser_accepts_agy_as_source_and_target(self) -> None:
         sessions = build_parser().parse_args(["sessions", "--agent", "agy"])

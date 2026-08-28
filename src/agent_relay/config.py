@@ -17,6 +17,7 @@ AGENT_DEFAULTS: dict[str, tuple[str, str, str]] = {
     "claude": ("claude", "CLAUDE_CONFIG_DIR", ".claude"),
     "agy": ("agy", "AGY_HOME", ".gemini/antigravity-cli"),
 }
+BUILTIN_MODEL_PROVIDERS = {"codex": "openai"}
 BUILTIN_AGENTS = tuple(AGENT_DEFAULTS)
 SUPPORTED_AGENTS = BUILTIN_AGENTS
 CUSTOM_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -74,6 +75,7 @@ def add_custom_agent(
     command: str,
     history_home: str | None = None,
     scan_history: bool = False,
+    model_provider: str | None = None,
 ) -> Path:
     if not CUSTOM_AGENT_NAME_RE.fullmatch(name):
         raise ValueError(
@@ -84,6 +86,9 @@ def add_custom_agent(
         raise ValueError(f"{name!r} is reserved for a built-in agent")
     if adapter not in AGENT_DEFAULTS:
         raise ValueError(f"unsupported adapter {adapter!r}")
+    provider = model_provider.strip() if isinstance(model_provider, str) else ""
+    if model_provider is not None and not provider:
+        raise ValueError("model provider must not be empty")
     resolved_command = _find_command(command)
     if resolved_command is None:
         raise ValueError(f"command is not an executable file: {command}")
@@ -103,6 +108,8 @@ def add_custom_agent(
         definition["history_home"] = str(Path(history_home).expanduser())
     if scan_history:
         definition["scan_history"] = True
+    if provider:
+        definition["model_provider"] = provider
 
     saved[name] = definition
     config["schema_version"] = 1
@@ -118,6 +125,25 @@ def remove_custom_agent(name: str) -> Path:
     if not isinstance(saved, dict) or name not in saved:
         raise ValueError(f"custom agent {name!r} does not exist")
     del saved[name]
+    config["schema_version"] = 1
+    config["custom_agents"] = saved
+    path = config_path()
+    atomic_write_json(path, config)
+    return path
+
+
+def update_custom_agent_provider(name: str, model_provider: str) -> Path:
+    provider = model_provider.strip()
+    if not provider:
+        raise ValueError("model provider must not be empty")
+    config = load_config()
+    saved = config.get("custom_agents", {})
+    if not isinstance(saved, dict) or name not in saved:
+        raise ValueError(f"custom agent {name!r} does not exist")
+    definition = saved[name]
+    if not isinstance(definition, dict):
+        raise ValueError(f"custom agent {name!r} has an invalid definition")
+    definition["model_provider"] = provider
     config["schema_version"] = 1
     config["custom_agents"] = saved
     path = config_path()
@@ -148,6 +174,7 @@ def discover_agents(use_saved: bool = True) -> dict[str, AgentInfo]:
             version=version,
             history_root=home,
             scan_history=True,
+            model_provider=BUILTIN_MODEL_PROVIDERS.get(name, ""),
         )
 
     for name, definition in _custom_definitions().items():
@@ -167,6 +194,11 @@ def discover_agents(use_saved: bool = True) -> dict[str, AgentInfo]:
             adapter_name=adapter,
             custom=True,
             scan_history=definition.get("scan_history") is True,
+            model_provider=(
+                str(definition["model_provider"]).strip()
+                if isinstance(definition.get("model_provider"), str)
+                else ""
+            ),
         )
     return result
 
